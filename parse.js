@@ -231,22 +231,42 @@ const ANY_PUNCT_OUTSIDE_CODE_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\
 
 function buildMask(src, links) {
   const n = src.length;
+  // Fast path: the mask can only change a code span (backtick), an escape
+  // (backslash), a link ([ or ![) or a tag/autolink (<). With none of
+  // those in the source, both passes below are no-ops, so the mask is
+  // the source itself. indexOf is a native memchr scan, far cheaper than
+  // the regex pass it replaces.
+  const hasTick = src.indexOf('`') !== -1;
+  const hasBs = src.indexOf('\\') !== -1;
+  if (!hasTick && !hasBs && src.indexOf('[') === -1 && src.indexOf('<') === -1) return src;
   // Pass 1 (marked's anyPunctuationOutsideCode): escapes -> '+', and a
   // code span's INNER backticks -> '+'. This is what lets blockSkip match
   // a link whose label holds a code span with an inner backtick
   // (`` a ` b `` -> `` a + b ``), so the whole link gets masked and any
   // emphasis inside its label stays literal (doc-20/doc-23).
-  const tmp = src.replace(ANY_PUNCT_OUTSIDE_CODE_RE, (m, run, esc) => {
+  // Without a backtick or a backslash the pattern cannot match at all,
+  // so skip the replace and reuse src.
+  const tmp = (!hasTick && !hasBs) ? src : src.replace(ANY_PUNCT_OUTSIDE_CODE_RE, (m, run, esc) => {
     if (esc) return '+'.repeat(m.length);
     if (run) return run + m.slice(run.length, -run.length).replace(/`/g, '+') + run;
     return m;
   });
   // Pass 2 (marked's blockSkip) on tmp: mask whole code spans, links and
   // HTML tags as '[' + a's + ']'. Positions line up with src (tmp has the
-  // same length). out starts from tmp so escapes / inner backticks stay
-  // neutralised as '+' in the mask.
-  const out = new Array(n);
-  for (let i = 0; i < n; i++) out[i] = tmp[i];
+  // same length). Instead of copying every char into an array and joining
+  // n one-char strings, accumulate the result as segments: the untouched
+  // text between masked spans is sliced (native copy) and each masked
+  // span becomes '[' + 'a'.repeat(len-2) + ']'.
+  const parts = [];
+  let cursor = 0;
+  const maskSpan = (a, b) => {
+    parts.push(tmp.slice(cursor, a));
+    // A masked span is '[' + a's + ']'; a 1-char span (never seen in
+    // practice: the shortest maskable span is 3 chars) collapses to ']',
+    // matching the old per-char writes.
+    parts.push(b - a === 1 ? ']' : '[' + 'a'.repeat(b - a - 2) + ']');
+    cursor = b;
+  };
   let i = 0;
   while (i < n) {
     const c = tmp.charCodeAt(i);
@@ -259,9 +279,7 @@ function buildMask(src, links) {
       const m = CODE_RE.exec(tmp);
       if (m) {
         const a = m.index, b = a + m[0].length;
-        out[a] = '[';
-        for (let j = a + 1; j < b - 1; j++) out[j] = 'a';
-        out[b - 1] = ']';
+        maskSpan(a, b);
         i = b;
         continue;
       }
@@ -279,9 +297,7 @@ function buildMask(src, links) {
       const lm = BLOCKSKIP_LINK_RE.exec(tmp);
       if (lm) {
         const end = start + lm[0].length;
-        out[start] = '[';
-        for (let t = start + 1; t < end - 1; t++) out[t] = 'a';
-        out[end - 1] = ']';
+        maskSpan(start, end);
         i = end;
         continue;
       }
@@ -300,9 +316,7 @@ function buildMask(src, links) {
           end = j + 1;
         }
         if (end > start) {
-          out[start] = '[';
-          for (let t = start + 1; t < end - 1; t++) out[t] = 'a';
-          out[end - 1] = ']';
+          maskSpan(start, end);
           i = end;
           continue;
         }
@@ -316,9 +330,7 @@ function buildMask(src, links) {
       if (!m) { AUTOLINK_RE.lastIndex = i; m = AUTOLINK_RE.exec(tmp); }
       if (m) {
         const a = m.index, b = a + m[0].length;
-        out[a] = '[';
-        for (let j = a + 1; j < b - 1; j++) out[j] = 'a';
-        out[b - 1] = ']';
+        maskSpan(a, b);
         i = b;
         continue;
       }
@@ -327,7 +339,8 @@ function buildMask(src, links) {
     }
     i++;
   }
-  return out.join('');
+  parts.push(tmp.slice(cursor));
+  return parts.join('');
 }
 // Find the index of the ']' closing the label that starts at openIdx, for
 // the mask: the label must contain no unescaped '[' (except inside a code
