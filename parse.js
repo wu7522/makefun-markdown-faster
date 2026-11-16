@@ -406,14 +406,18 @@ function scanLimits(masked) {
   let star = -1, und = -1, del = -1;
   const n = masked.length;
   for (let s = 0; s < n; s++) {
-    const r = masked[s];
-    if (r !== '*' && r !== '_' && r !== '~') continue;
-    const prev = s === 0 ? '\n' : masked[s - 1];
+    // charCodeAt, not masked[s]: indexing allocates a 1-char string per
+    // character, and this loop visits every character of every inline run
+    // that holds emphasis. Only ASCII codes are compared, so surrogates
+    // (never equal to them) behave identically.
+    const c = masked.charCodeAt(s);
+    if (c !== 42 && c !== 95 && c !== 126) continue;
+    const prev = s === 0 ? 10 : masked.charCodeAt(s - 1);
     let i = s + 1;
-    while (i < n && masked[i] === r) i++;
-    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
-      if (r === '~') del = s;
-      else if (r === '*') star = s;
+    while (i < n && masked.charCodeAt(i) === c) i++;
+    if (prev !== 32 && prev !== 9 && prev !== 10 && prev !== 13 && prev !== 12) {
+      if (c === 126) del = s;
+      else if (c === 42) star = s;
       else und = s;
     }
     s = i - 1;
@@ -692,6 +696,27 @@ function tryAutolink(run, pos, st) {
   if (h === null) return { html: esc(text, true), end: pos + t[0].length };
   return { html: '<a href="' + esc(h, true) + '">' + esc(text, true) + '</a>', end: pos + t[0].length };
 }
+// Fast pre-screen for tryUrl: URL_RE (sticky) can only match at pos when
+// the text starts with a scheme (http://, https://, ftp://), 'www.',
+// 'mailto:'/'xmpp:', or an email local part containing '@'. A plain
+// charCodeAt scan replaces the big regex exec for ordinary words; it never
+// says no when the regex could match (no false negatives: every regex
+// branch has its prefix checked here, and an email match always has an
+// '@' inside a [A-Za-z0-9._+-] run starting at pos).
+function urlMaybeAt(src, pos, n, c) {
+  if (c === 119) { if (src.startsWith('www.', pos)) return true; }
+  else if (c === 104 || c === 72 || c === 102 || c === 70) { if (schemeAt(src, pos, c)) return true; }
+  else if (c === 109) { if (src.startsWith('mailto:', pos)) return true; }
+  else if (c === 120) { if (src.startsWith('xmpp:', pos)) return true; }
+  let i = pos;
+  while (i < n) {
+    const d = src.charCodeAt(i);
+    if (d === 64) return true;
+    if (d < 128 && (IS_ALNUM[d] || d === 46 || d === 95 || d === 43 || d === 45)) { i++; continue; }
+    return false;
+  }
+  return false;
+}
 function tryUrl(run, pos, st) {
   URL_RE.lastIndex = pos;
   const t = URL_RE.exec(run.src);
@@ -837,7 +862,7 @@ function inlineRun(src, st) {
     } else if (c === 32) {
       res = tryBr(run, pos, st);
     }
-    if (!res && !st.inLink && ((c < 128 && IS_ALNUM[c]) || c === 43 || c === 46 || c === 45 || c === 95)) {
+    if (!res && !st.inLink && ((c < 128 && IS_ALNUM[c]) || c === 43 || c === 46 || c === 45 || c === 95) && urlMaybeAt(src, pos, n, c)) {
       res = tryUrl(run, pos, st);
     }
     if (res) {
@@ -1197,6 +1222,13 @@ function trySetext(lines, i, end) {
 // the definition, or -1. Registers the link unless mergeInto is given (in
 // which case the raw is returned for merging into a paragraph/text node).
 function tryDef(lines, i, end, st) {
+  // Fast path: a definition must open with '[' after 0-3 spaces. Most
+  // lines cannot be definitions, so skip the 32-line join and the big
+  // DEF_RE outright for them (the regex is anchored the same way).
+  const ln = lines[i];
+  let k = 0;
+  while (k < 3 && k < ln.length && ln.charCodeAt(k) === 32) k++;
+  if (k >= ln.length || ln.charCodeAt(k) !== 91) return null;
   const joined = lines.slice(i, Math.min(end, i + 32)).join('\n');
   const m = DEF_RE.exec(joined);
   if (!m) return null;
@@ -1394,12 +1426,13 @@ function tryList(lines, i, end, st) {
     if (y && j < end && isBlankLine(lines[j])) { itemEmpty = true; ateBlank = true; j++; }
     while (j < end && !ateBlank) {
       const f = lines[j];
-      if (nextBulletAt(f, R)) break;
-      if (hrAt(f, R)) break;
-      if (fencesBeginAt(f, R)) break;
-      if (headingBeginAt(f, R)) break;
-      if (htmlBeginAt(f, R)) break;
-      if (blockquoteBeginAt(f, R)) break;
+      const fc = firstContentChar(f, R);
+      if ((fc === 42 || fc === 43 || fc === 45 || (fc >= 48 && fc <= 57)) && nextBulletAt(f, R)) break;
+      if ((fc === 45 || fc === 95 || fc === 42) && hrAt(f, R)) break;
+      if ((fc === 96 || fc === 126) && fencesBeginAt(f, R)) break;
+      if (fc === 35 && headingBeginAt(f, R)) break;
+      if (fc === 60 && htmlBeginAt(f, R)) break;
+      if (fc === 62 && blockquoteBeginAt(f, R)) break;
       const H = expandLeadingTabs(f, 0);
       const hs = H.search(/[^ ]/);
       if (hs >= R || !f.trim()) {
@@ -1506,6 +1539,18 @@ const FENCES_BEGIN_AT = memoAt((k) => new RegExp('^ {0,' + k + '}(?:```|~~~)'));
 const HEADING_BEGIN_AT = memoAt((k) => new RegExp('^ {0,' + k + '}#{1,6}(?:\\s|$)'));
 const HTML_BEGIN_AT = memoAt((k) => new RegExp('^ {0,' + k + '}(?:</?(?:' + BLOCK_TAGS + ')(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)', 'i'));
 const BLOCKQUOTE_BEGIN_AT = memoAt((k) => new RegExp('^ {0,' + k + '}>'));
+// First content char of line after 0..R leading spaces, or -1 when none
+// of the ^ {0,R} block-start tests below can match (more than R leading
+// spaces, blank line). Lets tryList skip the regex tests for ordinary
+// text lines: every one of those regexes needs its first content char to
+// be in a small set, so any other char means all six fail.
+function firstContentChar(f, R) {
+  let i = 0;
+  while (i < f.length && i < R && f.charCodeAt(i) === 32) i++;
+  if (i >= f.length) return -1;
+  if (f.charCodeAt(i) === 32) return -1;
+  return f.charCodeAt(i);
+}
 function nextBulletAt(line, R) {
   return NEXT_BULLET_AT(R).test(line);
 }
